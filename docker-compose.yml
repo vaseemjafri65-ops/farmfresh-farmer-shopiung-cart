@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: farmcart
+      POSTGRES_USER: farmcart
+      POSTGRES_PASSWORD: farmcart
+    ports: ["5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U farmcart -d farmcart"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://farmcart:farmcart@db:5432/farmcart
+      JWT_SECRET: ${JWT_SECRET:-change-this-secret-before-deploying}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@farmfresh.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-FarmFresh123!}
+      CORS_ORIGINS: http://localhost:5173
+    ports: ["8000:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+  web:
+    build: ./frontend
+    environment:
+      VITE_API_URL: http://localhost:8000/api
+    ports: ["5173:5173"]
+    depends_on: [api]
+volumes:
+  postgres_data:
