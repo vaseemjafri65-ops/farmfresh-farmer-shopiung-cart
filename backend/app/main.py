@@ -2,7 +2,7 @@ import os, secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Path
 from fastapi.middleware.cors import CORSMiddleware
 from jose import jwt
 from passlib.context import CryptContext
@@ -10,7 +10,7 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import Session, joinedload
 from .database import Base, engine, get_db
 from .models import Product, CartItem, Order, OrderItem
-from .schemas import ProductInput, ProductOut, QuantityInput, CheckoutInput, LoginInput
+from .schemas import ProductInput, ProductOut, QuantityInput, CheckoutInput, LoginInput, HealthOut, LoginOut, CartOut, CartWithIdOut, OkOut, CheckoutOut, OrderOut
 
 Base.metadata.create_all(bind=engine)
 from .database import SessionLocal
@@ -47,10 +47,10 @@ def cart_payload(db: Session, sid: str):
     items = [{"id": r.id, "quantity": r.quantity, "product": ProductOut.model_validate(r.product).model_dump(), "line_total": round(float(r.product.price) * r.quantity, 2)} for r in rows]
     return {"items": items, "total": round(sum(x["line_total"] for x in items), 2), "count": sum(x["quantity"] for x in items)}
 
-@app.get("/api/health")
+@app.get("/api/health", response_model=HealthOut)
 def health(): return {"status": "ok"}
 
-@app.post("/api/auth/login")
+@app.post("/api/auth/login", response_model=LoginOut)
 def login(data: LoginInput):
     if data.email.lower() != ADMIN_EMAIL or not pwd.verify(data.password, ADMIN_HASH): raise HTTPException(401, "Email or password is incorrect")
     return {"access_token": jwt.encode({"sub": ADMIN_EMAIL, "exp": datetime.now(timezone.utc) + timedelta(hours=12)}, JWT_SECRET, algorithm="HS256"), "token_type": "bearer"}
@@ -64,7 +64,7 @@ def products(search: str = "", category: str = "", admin: bool = False, authoriz
     if category.strip() and category != "All": q = q.where(Product.category == category)
     return db.scalars(q).all()
 
-@app.get("/api/products/categories")
+@app.get("/api/products/categories", response_model=list[str])
 def categories(db: Session = Depends(get_db)):
     return db.scalars(select(Product.category).where(Product.active.is_(True)).distinct().order_by(Product.category)).all()
 
@@ -86,17 +86,17 @@ def update_product(product_id: int, data: ProductInput, db: Session = Depends(ge
     for key, value in data.model_dump().items(): setattr(product, key, value)
     db.commit(); db.refresh(product); return product
 
-@app.delete("/api/products/{product_id}", dependencies=[Depends(admin_guard)])
-def delete_product(product_id: int, db: Session = Depends(get_db)):
+@app.delete("/api/products/{product_id}", response_model=OkOut, dependencies=[Depends(admin_guard)])
+def delete_product(product_id: int = Path(..., description="Required. Use an existing product ID from GET /api/products."), db: Session = Depends(get_db)):
     product = db.get(Product, product_id)
     if not product: raise HTTPException(404, "Product not found")
     db.delete(product); db.commit(); return {"ok": True}
 
-@app.get("/api/cart")
+@app.get("/api/cart", response_model=CartOut)
 def get_cart(x_cart_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     return cart_payload(db, x_cart_id or "")
 
-@app.post("/api/cart/items/{product_id}")
+@app.post("/api/cart/items/{product_id}", response_model=CartWithIdOut)
 def add_cart(product_id: int, data: QuantityInput, x_cart_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     sid = x_cart_id or str(uuid4()); product = db.get(Product, product_id)
     if not product or not product.active: raise HTTPException(404, "Product is unavailable")
@@ -107,20 +107,20 @@ def add_cart(product_id: int, data: QuantityInput, x_cart_id: str | None = Heade
     else: db.add(CartItem(session_id=sid, product_id=product_id, quantity=data.quantity))
     db.commit(); return {**cart_payload(db, sid), "cart_id": sid}
 
-@app.put("/api/cart/items/{item_id}")
+@app.put("/api/cart/items/{item_id}", response_model=CartOut)
 def update_cart(item_id: int, data: QuantityInput, x_cart_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     row = db.scalar(select(CartItem).options(joinedload(CartItem.product)).where(CartItem.id == item_id, CartItem.session_id == (x_cart_id or "")))
     if not row: raise HTTPException(404, "Cart item not found")
     if data.quantity > row.product.stock: raise HTTPException(409, f"Only {row.product.stock} available")
     row.quantity = data.quantity; db.commit(); return cart_payload(db, row.session_id)
 
-@app.delete("/api/cart/items/{item_id}")
+@app.delete("/api/cart/items/{item_id}", response_model=CartOut)
 def remove_cart(item_id: int, x_cart_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     row = db.scalar(select(CartItem).where(CartItem.id == item_id, CartItem.session_id == (x_cart_id or "")))
     if row: db.delete(row); db.commit()
     return cart_payload(db, x_cart_id or "")
 
-@app.post("/api/orders/checkout")
+@app.post("/api/orders/checkout", response_model=CheckoutOut)
 def checkout(data: CheckoutInput, x_cart_id: str | None = Header(default=None), db: Session = Depends(get_db)):
     sid = x_cart_id or ""; rows = db.scalars(select(CartItem).options(joinedload(CartItem.product)).where(CartItem.session_id == sid).with_for_update()).all()
     if not rows: raise HTTPException(400, "Your cart is empty")
@@ -135,7 +135,7 @@ def checkout(data: CheckoutInput, x_cart_id: str | None = Header(default=None), 
     db.add(order); db.commit(); db.refresh(order)
     return {"order_number": order.order_number, "total": float(order.total), "created_at": order.created_at}
 
-@app.get("/api/orders", dependencies=[Depends(admin_guard)])
+@app.get("/api/orders", response_model=list[OrderOut], dependencies=[Depends(admin_guard)])
 def list_orders(db: Session = Depends(get_db)):
     orders = db.scalars(select(Order).options(joinedload(Order.items)).order_by(Order.created_at.desc())).unique().all()
     return [{"order_number": o.order_number, "customer_name": o.customer_name, "email": o.email, "address": o.address, "total": float(o.total), "created_at": o.created_at, "items": [{"name": i.product_name, "quantity": i.quantity, "unit_price": float(i.unit_price)} for i in o.items]} for o in orders]
